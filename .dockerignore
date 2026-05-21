@@ -1,0 +1,19 @@
+# Never bake secrets or local state into the image.
+.env
+.env.*
+!.env.example
+
+# Local DB / embedded-replica cache (rebuilt from Turso on boot).
+*.db
+*.db-wal
+*.db-shm
+
+# Python / tooling cruft.
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.gitignore
+.claude/
+*.md

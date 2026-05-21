@@ -1,0 +1,28 @@
+# Fly.io config for the Historical RAG Memory Discord bot.
+# This is a WORKER (outbound-only Discord gateway connection) — no public
+# port, no [http_service] section. The single machine runs main.py 24/7.
+#
+# IMPORTANT: a Discord bot allows only ONE gateway session per token.
+# Always redeploy with:   flyctl deploy --ha=false
+# (--ha=false stops Fly recreating a standby machine, which would cause
+#  two instances to briefly run at once and fight over the connection.)
+#
+# If `fly deploy` says the app name is taken, change the line below to
+# something unique (e.g. "mannully-bot-johnm") and run it again.
+app = "mannully-bot"
+primary_region = "iad"
+
+[build]
+  # No builder specified -> Fly uses the included Dockerfile (Python 3.12,
+  # where the libsql wheel installs cleanly on Linux).
+  dockerfile = "Dockerfile"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+# One always-on machine. No autostop: a Discord bot must hold its gateway
+# connection continuously, so the machine never idles down.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+  cpus = 1
