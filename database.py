@@ -119,6 +119,39 @@ def _maybe_sync() -> None:
             )
 
 
+def _is_stale_stream_error(exc: BaseException) -> bool:
+    # Turso/Hrana expires idle remote "streams" server-side; after that
+    # every call against the cached _CONN gets 404 "stream not found"
+    # until we reconnect. The driver surfaces it as a ValueError whose
+    # message embeds the raw Hrana api error.
+    msg = str(exc)
+    return "stream not found" in msg or ("Hrana" in msg and "404" in msg)
+
+
+def _reset_connection() -> None:
+    global _CONN
+    if _CONN is not None:
+        try:
+            _CONN.close()
+        except Exception:
+            pass
+    _CONN = None
+
+
+def _run_with_reconnect(op):
+    # Callers hold _LOCK, so the failed attempt and the retry are atomic
+    # w.r.t. other threads — no risk of another thread observing the
+    # half-reset state.
+    try:
+        return op()
+    except Exception as exc:
+        if not _is_stale_stream_error(exc):
+            raise
+        log.warning("libSQL stream expired; reconnecting and retrying once.")
+        _reset_connection()
+        return op()
+
+
 _DROP_SQL = """
     DROP TRIGGER IF EXISTS messages_ai;
     DROP TRIGGER IF EXISTS messages_ad;
@@ -237,11 +270,13 @@ def init_db() -> None:
 # don't depend on sqlite3.Row, which libSQL does not provide)
 # --------------------------------------------------------------------------
 def _query(sql: str, params: tuple = ()) -> list[dict[str, Any]]:
-    with _LOCK:
+    def _do() -> list[dict[str, Any]]:
         cur = _connect().cursor()
         cur.execute(sql, params)
         cols = [d[0] for d in cur.description] if cur.description else []
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+    with _LOCK:
+        return _run_with_reconnect(_do)
 
 
 def _query_one(sql: str, params: tuple = ()) -> Optional[dict[str, Any]]:
@@ -314,7 +349,7 @@ def insert_messages_batch(messages: Iterable[dict[str, Any]]) -> int:
     if not rows:
         return 0
 
-    with _LOCK:
+    def _do() -> int:
         conn = _connect()
         cur = conn.cursor()
         # Engine-agnostic new-row count: total_changes is not exposed by the
@@ -338,6 +373,9 @@ def insert_messages_batch(messages: Iterable[dict[str, Any]]) -> int:
         _maybe_sync()
         return after - before
 
+    with _LOCK:
+        return _run_with_reconnect(_do)
+
 
 # --------------------------------------------------------------------------
 # Sync-state tracking
@@ -354,7 +392,7 @@ def set_sync_state(
     last_message_id: Optional[int],
     message_count: int,
 ) -> None:
-    with _LOCK:
+    def _do() -> None:
         conn = _connect()
         conn.execute(
             """
@@ -378,6 +416,9 @@ def set_sync_state(
         )
         conn.commit()
         _maybe_sync()
+
+    with _LOCK:
+        _run_with_reconnect(_do)
 
 
 # --------------------------------------------------------------------------
@@ -430,39 +471,283 @@ def _fts_query(text: str) -> str:
     return " OR ".join(tokens)
 
 
-def search_by_keyword(query: str, limit: int = 30) -> list[dict[str, Any]]:
-    """Full-text keyword search, best matches first (BM25 ranking)."""
+def search_by_keyword(
+    query: str, limit: int = 30, guild_id: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Full-text keyword search, best matches first (BM25 ranking).
+
+    ``guild_id`` scopes the search to one server; pass None only for
+    admin/global lookups - the per-question RAG path MUST pass it so the
+    bot does not conflate histories from different servers.
+    """
     match = _fts_query(query)
     if not match:
         return []
-    rows = _query(
-        """
-        SELECT m.*
-        FROM messages_fts f
-        JOIN messages m ON m.rowid_pk = f.rowid
-        WHERE messages_fts MATCH ?
-        ORDER BY bm25(messages_fts), m.created_ts DESC
-        LIMIT ?
-        """,
-        (match, limit),
-    )
+    if guild_id is not None:
+        rows = _query(
+            """
+            SELECT m.*
+            FROM messages_fts f
+            JOIN messages m ON m.rowid_pk = f.rowid
+            WHERE messages_fts MATCH ? AND m.guild_id = ?
+            ORDER BY bm25(messages_fts), m.created_ts DESC
+            LIMIT ?
+            """,
+            (match, str(guild_id), limit),
+        )
+    else:
+        rows = _query(
+            """
+            SELECT m.*
+            FROM messages_fts f
+            JOIN messages m ON m.rowid_pk = f.rowid
+            WHERE messages_fts MATCH ?
+            ORDER BY bm25(messages_fts), m.created_ts DESC
+            LIMIT ?
+            """,
+            (match, limit),
+        )
     return [_row_to_message(r) for r in rows]
 
 
 def search_by_timeframe(
-    start_ts: float, end_ts: float, limit: int = 200
+    start_ts: float,
+    end_ts: float,
+    limit: int = 200,
+    guild_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """All messages within [start_ts, end_ts] (epoch seconds), oldest first."""
-    rows = _query(
+    """All messages within [start_ts, end_ts] (epoch seconds), oldest first.
+
+    Scoped to ``guild_id`` when provided (see search_by_keyword).
+    """
+    if guild_id is not None:
+        rows = _query(
+            """
+            SELECT * FROM messages
+            WHERE created_ts BETWEEN ? AND ? AND guild_id = ?
+            ORDER BY created_ts ASC
+            LIMIT ?
+            """,
+            (start_ts, end_ts, str(guild_id), limit),
+        )
+    else:
+        rows = _query(
+            """
+            SELECT * FROM messages
+            WHERE created_ts BETWEEN ? AND ?
+            ORDER BY created_ts ASC
+            LIMIT ?
+            """,
+            (start_ts, end_ts, limit),
+        )
+    return [_row_to_message(r) for r in rows]
+
+
+def find_author(
+    name_substring: str, guild_id: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    """Best-match author by name substring within a guild (or globally).
+
+    Returns the most active matching author (case-insensitive substring
+    on author_name). None if no match.
+    """
+    if not name_substring:
+        return None
+    safe = (
+        name_substring.lower()
+        .replace("%", "").replace("_", "").replace("\x00", "").strip()
+    )
+    if not safe:
+        return None
+    pattern = f"%{safe}%"
+    if guild_id is not None:
+        return _query_one(
+            """
+            SELECT author_id, author_name, COUNT(*) AS msg_count
+            FROM messages
+            WHERE LOWER(author_name) LIKE ?
+              AND author_id IS NOT NULL
+              AND guild_id = ?
+            GROUP BY author_id, author_name
+            ORDER BY msg_count DESC
+            LIMIT 1
+            """,
+            (pattern, str(guild_id)),
+        )
+    return _query_one(
         """
+        SELECT author_id, author_name, COUNT(*) AS msg_count
+        FROM messages
+        WHERE LOWER(author_name) LIKE ? AND author_id IS NOT NULL
+        GROUP BY author_id, author_name
+        ORDER BY msg_count DESC
+        LIMIT 1
+        """,
+        (pattern,),
+    )
+
+
+def search_by_author_id(
+    author_id: str,
+    limit: int = 300,
+    exclude_id: Optional[str] = None,
+    guild_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Most recent N substantive messages by an author, scoped to a guild
+    when provided. The same user can be active in several servers, so
+    pass guild_id whenever you want a single-server read.
+    """
+    clauses = ["author_id = ?", "content != ''"]
+    params: list[Any] = [str(author_id)]
+    if exclude_id is not None:
+        clauses.append("message_id != ?")
+        params.append(str(exclude_id))
+    if guild_id is not None:
+        clauses.append("guild_id = ?")
+        params.append(str(guild_id))
+    params.append(limit)
+    rows = _query(
+        f"""
         SELECT * FROM messages
-        WHERE created_ts BETWEEN ? AND ?
-        ORDER BY created_ts ASC
+        WHERE {' AND '.join(clauses)}
+        ORDER BY created_ts DESC
         LIMIT ?
         """,
-        (start_ts, end_ts, limit),
+        tuple(params),
     )
     return [_row_to_message(r) for r in rows]
+
+
+def top_authors_sample(
+    per_author: int = 80,
+    max_authors: int = 12,
+    guild_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Sample messages from the top-K most active authors in a guild.
+
+    Used for "describe everyone's personalities" style questions. One
+    query per author (~50ms each on Turso) so kept small. Pass guild_id
+    to keep the read scoped to one server's most-active members.
+    """
+    if guild_id is not None:
+        top = _query(
+            """
+            SELECT author_id
+            FROM messages
+            WHERE content != ''
+              AND author_id IS NOT NULL
+              AND guild_id = ?
+            GROUP BY author_id
+            ORDER BY COUNT(*) DESC
+            LIMIT ?
+            """,
+            (str(guild_id), max_authors),
+        )
+    else:
+        top = _query(
+            """
+            SELECT author_id
+            FROM messages
+            WHERE content != '' AND author_id IS NOT NULL
+            GROUP BY author_id
+            ORDER BY COUNT(*) DESC
+            LIMIT ?
+            """,
+            (max_authors,),
+        )
+    out: list[dict[str, Any]] = []
+    for a in top:
+        aid = a.get("author_id")
+        if not aid:
+            continue
+        if guild_id is not None:
+            msgs = _query(
+                """
+                SELECT * FROM messages
+                WHERE author_id = ?
+                  AND content != ''
+                  AND guild_id = ?
+                ORDER BY created_ts DESC
+                LIMIT ?
+                """,
+                (str(aid), str(guild_id), per_author),
+            )
+        else:
+            msgs = _query(
+                """
+                SELECT * FROM messages
+                WHERE author_id = ? AND content != ''
+                ORDER BY created_ts DESC
+                LIMIT ?
+                """,
+                (str(aid), per_author),
+            )
+        out.extend(_row_to_message(r) for r in msgs)
+    return out
+
+
+def time_sample(
+    buckets: int = 24,
+    per_bucket: int = 30,
+    guild_id: Optional[str] = None,
+) -> list[dict[str, Any]]:
+    """Sample substantive messages evenly across a guild's archive span.
+
+    Splits [oldest, newest] into N equal time buckets and pulls up to M
+    longest messages from each. Pass guild_id so the span and the
+    samples are both scoped to one server.
+    """
+    if guild_id is not None:
+        span = _query_one(
+            """
+            SELECT MIN(created_ts) AS lo, MAX(created_ts) AS hi
+            FROM messages
+            WHERE guild_id = ?
+            """,
+            (str(guild_id),),
+        )
+    else:
+        span = _query_one(
+            "SELECT MIN(created_ts) AS lo, MAX(created_ts) AS hi FROM messages"
+        )
+    if not span or span.get("lo") is None or span.get("hi") is None:
+        return []
+    lo, hi = float(span["lo"]), float(span["hi"])
+    if hi <= lo or buckets <= 0:
+        return []
+    step = (hi - lo) / buckets
+    out: list[dict[str, Any]] = []
+    for i in range(buckets):
+        s = lo + i * step
+        e = lo + (i + 1) * step + (1e-3 if i == buckets - 1 else 0)
+        if guild_id is not None:
+            rows = _query(
+                """
+                SELECT * FROM messages
+                WHERE created_ts >= ? AND created_ts < ?
+                  AND guild_id = ?
+                  AND content != ''
+                  AND LENGTH(content) > 20
+                ORDER BY LENGTH(content) DESC
+                LIMIT ?
+                """,
+                (s, e, str(guild_id), per_bucket),
+            )
+        else:
+            rows = _query(
+                """
+                SELECT * FROM messages
+                WHERE created_ts >= ? AND created_ts < ?
+                  AND content != ''
+                  AND LENGTH(content) > 20
+                ORDER BY LENGTH(content) DESC
+                LIMIT ?
+                """,
+                (s, e, per_bucket),
+            )
+        out.extend(_row_to_message(r) for r in rows)
+    out.sort(key=lambda m: m["created_ts"])
+    return out
 
 
 def get_recent_messages(limit: int = 30) -> list[dict[str, Any]]:

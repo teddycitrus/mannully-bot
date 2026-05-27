@@ -106,12 +106,21 @@ def parse_timeframe(text: str):
 # --------------------------------------------------------------------------
 # RAG retrieval
 # --------------------------------------------------------------------------
-async def retrieve_evidence(question: str) -> list[dict]:
-    """Combine keyword search with an optional timeframe filter."""
+async def retrieve_evidence(
+    question: str,
+    exclude_id: int | None = None,
+    guild_id: int | None = None,
+) -> list[dict]:
+    """Combine keyword search with an optional timeframe filter.
+
+    ``guild_id`` scopes both queries to one server so the bot never
+    mixes histories from servers it's also a member of.
+    """
     limit = config.RAG_MAX_CONTEXT_MESSAGES
+    gid = str(guild_id) if guild_id is not None else None
 
     keyword_hits = await asyncio.to_thread(
-        database.search_by_keyword, question, limit
+        database.search_by_keyword, question, limit, gid
     )
 
     window = parse_timeframe(question)
@@ -119,13 +128,21 @@ async def retrieve_evidence(question: str) -> list[dict]:
     if window:
         start_ts, end_ts = window
         time_hits = await asyncio.to_thread(
-            database.search_by_timeframe, start_ts, end_ts, limit
+            database.search_by_timeframe, start_ts, end_ts, limit, gid
         )
 
+    # Drop the live question itself: on_message archives the question
+    # before retrieval runs, and FTS5/BM25 ranks the user's own words as
+    # the top hit, which Gemini then cites back at them.
+    exclude = str(exclude_id) if exclude_id is not None else None
+
     # Merge, de-dupe by message id, keep chronological order for the LLM.
-    merged: dict[int, dict] = {}
+    merged: dict[str, dict] = {}
     for m in keyword_hits + time_hits:
-        merged[m["message_id"]] = m
+        mid = m["message_id"]
+        if exclude is not None and str(mid) == exclude:
+            continue
+        merged[mid] = m
 
     # No "recent activity" fallback on purpose: if the archive has nothing
     # relevant, return empty so the bot answers conversationally instead of
@@ -291,6 +308,46 @@ def _reference_lines(
     return out
 
 
+_SELF_RE = re.compile(
+    r"(?:^|\s)(?:my|me|i'?m|i'?ve|myself)(?:\s|[?!.,]|$)|(?:^|\s)i(?:\s|[?!.,]|$)",
+    re.IGNORECASE,
+)
+
+
+async def _resolve_author(
+    question: str, message: discord.Message, hint: str | None
+) -> dict | None:
+    """Figure out which archived author a by_author question is about.
+
+    Priority: an explicit Discord @-mention of another member, then a
+    self-reference (asker themselves), then a fuzzy name match against
+    the archive (scoped to THIS server so we don't pick someone with
+    the same nickname from a different guild). None if nothing pans
+    out.
+    """
+    others = [u for u in message.mentions if u.id != bot.user.id]
+    if others:
+        u = others[0]
+        return {"author_id": str(u.id), "author_name": str(u)}
+
+    looks_self = hint == "self" or bool(_SELF_RE.search(question))
+    if looks_self:
+        return {
+            "author_id": str(message.author.id),
+            "author_name": str(message.author),
+        }
+
+    if hint:
+        gid = str(message.guild.id) if message.guild else None
+        found = await asyncio.to_thread(database.find_author, hint, gid)
+        if found:
+            return {
+                "author_id": found["author_id"],
+                "author_name": found["author_name"],
+            }
+    return None
+
+
 async def handle_question(message: discord.Message) -> None:
     # Strip the bot mention to get the bare question.
     question = re.sub(r"<@!?\d+>", "", message.content).strip()
@@ -304,30 +361,74 @@ async def handle_question(message: discord.Message) -> None:
         return
 
     async with message.channel.typing():
-        # Only touch the archive when the message is actually a recall
-        # question. An explicit timeframe ("2 days ago") always qualifies;
-        # otherwise ask the lightweight classifier. Image-only messages and
-        # plain chat skip retrieval entirely so the bot doesn't quote
-        # unrelated history on every reply.
         evidence: list[dict] = []
-        do_history = False
+        strategy = "none"
+        author_label: str | None = None
+        searched = False
+
         if question:
-            do_history = bool(parse_timeframe(question)) or (
-                await gemini_client.needs_history(question)
-            )
-            if do_history:
-                evidence = await retrieve_evidence(question)
+            # Explicit timeframe ("2 days ago") always means keyword/time
+            # retrieval; skip the classifier round-trip in that case.
+            if parse_timeframe(question):
+                plan = {"strategy": "keyword", "author_hint": None}
+            else:
+                plan = await gemini_client.plan_retrieval(question)
+
+            strategy = plan["strategy"]
+            hint = plan.get("author_hint")
+
+            # Scope every retrieval to the asking guild so the bot does
+            # NOT mix histories across servers it's also a member of.
+            gid = str(message.guild.id) if message.guild else None
+
+            if strategy == "keyword":
+                evidence = await retrieve_evidence(
+                    question,
+                    exclude_id=message.id,
+                    guild_id=message.guild.id if message.guild else None,
+                )
+                searched = True
+            elif strategy == "by_author":
+                target = await _resolve_author(question, message, hint)
+                if target:
+                    author_label = target["author_name"]
+                    evidence = await asyncio.to_thread(
+                        database.search_by_author_id,
+                        target["author_id"],
+                        300,
+                        str(message.id),
+                        gid,
+                    )
+                    searched = True
+                else:
+                    # Couldn't pin down who — fall back to plain chat so
+                    # the model can ask for clarification.
+                    strategy = "none"
+            elif strategy == "multi_author":
+                evidence = await asyncio.to_thread(
+                    database.top_authors_sample, 80, 12, gid
+                )
+                searched = True
+            elif strategy == "time_sample":
+                evidence = await asyncio.to_thread(
+                    database.time_sample, 24, 30, gid
+                )
+                searched = True
+            # strategy == "none" -> no retrieval
 
         answer = await gemini_client.answer_question(
             question or "What is in this image?",
             evidence,
             images=images or None,
-            searched=do_history,
+            searched=searched,
+            strategy=strategy,
+            author_label=author_label,
         )
         # Always strip the machine-only CITES line so it never shows.
         answer, cited_ids = _strip_cites(answer)
-        # Reference ONLY the message(s) the answer actually used.
-        if evidence and cited_ids:
+        # References only land for the keyword path — synthesis answers
+        # (by_author / multi_author / time_sample) don't cite.
+        if strategy == "keyword" and evidence and cited_ids:
             guild_id = message.guild.id if message.guild else None
             refs = _reference_lines(cited_ids, evidence, guild_id)
             if refs:
@@ -403,8 +504,14 @@ async def stats_cmd(ctx: commands.Context) -> None:
 async def ask_cmd(ctx: commands.Context, *, question: str) -> None:
     """Ask a historical question without @-mentioning the bot."""
     async with ctx.typing():
-        evidence = await retrieve_evidence(question)
-        answer = await gemini_client.answer_question(question, evidence)
+        evidence = await retrieve_evidence(
+            question,
+            guild_id=ctx.guild.id if ctx.guild else None,
+        )
+        answer = await gemini_client.answer_question(
+            question, evidence, searched=True, strategy="keyword",
+        )
+        answer, _ = _strip_cites(answer)
     await send_chunked(ctx.channel, answer)
 
 

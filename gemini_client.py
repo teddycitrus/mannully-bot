@@ -16,13 +16,19 @@ Responsibilities
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from typing import Any, Optional, Sequence
 
 import google.generativeai as genai
 from PIL import Image
 
 import config
+
+# Retrieval strategies the router can pick. Anything else is treated as
+# "keyword" (the safest fallback).
+STRATEGIES = {"none", "keyword", "by_author", "multi_author", "time_sample"}
 
 log = logging.getLogger("gemini")
 
@@ -39,32 +45,46 @@ _SYSTEM_INSTRUCTION = (
     "sentence instead.\n"
     "3. Be concise. Answer directly with no preamble, padding, or "
     "filler. A sentence or two is usually enough.\n"
-    "4. Always be factual and accurate. Never make anything up. If you "
-    "are unsure or the information is not available, just say so "
-    "plainly.\n"
+    "4. Always be factual and accurate. Never make anything up. When "
+    "unsure or the info isn't there, say it casually like a person "
+    "would: 'idk', 'not sure', 'no clue', 'nothing on that'. NEVER "
+    "use robotic phrasings like 'the evidence does not state', 'the "
+    "archive does not contain', 'the provided information does not "
+    "indicate', or anything similar.\n"
     "5. Sound human and natural, but neutral: no roleplay, no catch "
     "phrases, no slang gimmick, no emotional act.\n\n"
     "Grounding:\n"
+    "- Each archive line is [id=NUMBER] [timestamp] #channel <author>: "
+    "message.\n"
     "- If the prompt contains an 'ARCHIVED EVIDENCE' block, the member "
-    "is asking about the server's past. Answer ONLY from that evidence, "
-    "name the people involved, and reference the date/channel when "
-    "relevant. Each evidence line is "
-    "[id=NUMBER] [timestamp] #channel <author>: message. If the evidence "
-    "does not contain the answer, say so plainly. NEVER invent events, "
-    "people, or dates.\n"
-    "- CITATION: after your reply, add a final separate line in EXACTLY "
-    "this form: 'CITES: <comma-separated id numbers of ONLY the specific "
-    "evidence messages you actually used to answer>'. If you used none, "
-    "write 'CITES: none'. This line is MANDATORY whenever an evidence "
-    "block is present, it is exempt from the conciseness rule, and you "
-    "must never omit it. It is stripped out before the message is "
-    "posted; never refer to it in your prose, and put nothing after "
-    "it.\n"
-    "- If there is NO evidence block, the member is just talking to you. "
-    "Reply normally and concisely. Do NOT quote, cite, or pretend to "
-    "recall past server messages: you have nothing to look up, so do "
-    "not make anything up or reference history that was not given to "
-    "you."
+    "is asking a specific recall question. Answer ONLY from that "
+    "evidence, name the people involved, and reference the date/channel "
+    "when relevant. If the evidence doesn't actually answer the "
+    "question, say so casually ('idk', 'not sure', 'nothing on that') "
+    "and NEVER 'the evidence does not state' / 'the archive does not "
+    "contain'. NEVER invent events, people, or dates. After your reply, "
+    "add a final separate line in EXACTLY this form: 'CITES: <comma-"
+    "separated id numbers of ONLY the specific evidence messages you "
+    "actually used to answer>'. If you used none, write 'CITES: none'. "
+    "This line is MANDATORY for ARCHIVED EVIDENCE, it is exempt from "
+    "the conciseness rule, and you must never omit it. It is stripped "
+    "out before posting, never refer to it in your prose, and put "
+    "nothing after it.\n"
+    "- If the prompt contains an 'ARCHIVE SAMPLE' block, the member is "
+    "asking for a synthesis or summary (a personality read, an overview "
+    "of activity, the vibe of the server, etc). Treat the sample as "
+    "source material: characterise people, themes, tendencies, and "
+    "concrete examples drawn from what's there. You DO NOT need to "
+    "produce a CITES line for ARCHIVE SAMPLE. Be honest if the sample "
+    "really is too thin; otherwise commit to a real read instead of "
+    "hedging. The conciseness rule is relaxed for these: a short "
+    "paragraph or a few bullets per subject is fine when it's "
+    "warranted, but don't pad.\n"
+    "- If there is NO archive block, the member is just talking to "
+    "you. Reply normally and concisely. Do NOT quote, cite, or pretend "
+    "to recall past server messages: you have nothing to look up, so "
+    "do not make anything up or reference history that was not given "
+    "to you."
 )
 
 _model = genai.GenerativeModel(
@@ -77,32 +97,81 @@ _model = genai.GenerativeModel(
 _classifier_model = genai.GenerativeModel(config.GEMINI_MODEL)
 
 
-async def needs_history(question: str) -> bool:
-    """True if answering `question` requires looking up past server messages.
+_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE | re.DOTALL)
 
-    Used to gate RAG retrieval so the bot only quotes/cites the archive for
-    genuine recall questions, not for greetings or general chat. Fails open
-    (returns True) so a classifier error never causes a made-up answer.
+
+async def plan_retrieval(question: str) -> dict[str, Any]:
+    """Decide what kind of archive lookup `question` needs.
+
+    Returns a plan dict: {"strategy": <name>, "author_hint": <str|None>}.
+    Strategies:
+      none         -> answer conversationally, skip the archive
+      keyword      -> BM25 over message text (specific recall + timeframe)
+      by_author    -> pull one author's messages (personality/vibe reads)
+      multi_author -> sample top active authors (everyone's personalities)
+      time_sample  -> sample across the server's timeline (overall history)
+
+    Fails safe: an error or unknown strategy maps to "keyword" so the bot
+    still tries to ground its answer rather than blurt out invented info.
     """
     probe = (
-        "You decide if a Discord message needs the server's PAST message "
-        "history to answer. Reply with exactly one word: yes or no.\n"
-        "yes = asks about something that happened / was said before, who "
-        "did/said something, when something occurred, or references a past "
-        "time.\n"
-        "no = a greeting, opinion, general knowledge, or anything "
-        "answerable without server history.\n\n"
+        "Classify a Discord message into ONE retrieval strategy for "
+        "searching the server's past message archive. Reply with a "
+        "single-line JSON object: "
+        "{\"strategy\": <name>, \"author_hint\": <name or null>}.\n\n"
+        "Strategies:\n"
+        "- \"none\": greetings, opinions, general world knowledge, "
+        "questions about current/real-time state, anything where the "
+        "archive isn't needed.\n"
+        "- \"keyword\": specific recall with discriminating keywords "
+        "(proper nouns, named events, in-jokes, channel-specific "
+        "topics). BM25 over message text will surface useful hits. Use "
+        "this whenever the question pins to a specific event or topic.\n"
+        "- \"by_author\": questions about ONE person's personality, "
+        "vibe, habits, or what they talk about. Set author_hint to "
+        "their name, or to \"self\" if asking about the speaker "
+        "themselves (uses 'my', 'me', 'I'm', 'I').\n"
+        "- \"multi_author\": questions about EVERYONE or multiple "
+        "people's personalities or vibes (\"everyone's personalities\", "
+        "\"describe each person\", \"who's who in this server\").\n"
+        "- \"time_sample\": questions about the server's overall "
+        "history, major events, big moments, what's happened in "
+        "general, or the vibe over time, when no specific keywords pin "
+        "it to one event.\n\n"
+        "Examples:\n"
+        "'good morning' -> {\"strategy\":\"none\",\"author_hint\":null}\n"
+        "'is python better than rust' -> {\"strategy\":\"none\",\"author_hint\":null}\n"
+        "'who proposed the mall meetup last week' -> {\"strategy\":\"keyword\",\"author_hint\":null}\n"
+        "'what restaurant does usman always ask about' -> {\"strategy\":\"keyword\",\"author_hint\":null}\n"
+        "'whats my personality like' -> {\"strategy\":\"by_author\",\"author_hint\":\"self\"}\n"
+        "'describe me based on my messages' -> {\"strategy\":\"by_author\",\"author_hint\":\"self\"}\n"
+        "'describe usman based on his messages' -> {\"strategy\":\"by_author\",\"author_hint\":\"usman\"}\n"
+        "'what does bob talk about a lot' -> {\"strategy\":\"by_author\",\"author_hint\":\"bob\"}\n"
+        "'give me everyones personalities' -> {\"strategy\":\"multi_author\",\"author_hint\":null}\n"
+        "'describe everyone in this server' -> {\"strategy\":\"multi_author\",\"author_hint\":null}\n"
+        "'what are some major things that happened in this server' -> {\"strategy\":\"time_sample\",\"author_hint\":null}\n"
+        "'whats the vibe of this server' -> {\"strategy\":\"time_sample\",\"author_hint\":null}\n\n"
         f"Message: {question}\nAnswer:"
     )
 
-    def _gen() -> bool:
+    def _gen() -> dict[str, Any]:
         try:
             resp = _classifier_model.generate_content(probe)
-            text = (getattr(resp, "text", "") or "").strip().lower()
-            return text.startswith("y")
+            raw = (getattr(resp, "text", "") or "").strip()
+            raw = _FENCE_RE.sub("", raw).strip()
+            data = json.loads(raw)
+            strategy = str(data.get("strategy") or "").strip().lower()
+            if strategy not in STRATEGIES:
+                strategy = "keyword"
+            hint = data.get("author_hint")
+            if isinstance(hint, str):
+                hint = hint.strip() or None
+            else:
+                hint = None
+            return {"strategy": strategy, "author_hint": hint}
         except Exception:
-            log.exception("history-intent classification failed; assuming yes")
-            return True
+            log.exception("retrieval planning failed; defaulting to keyword")
+            return {"strategy": "keyword", "author_hint": None}
 
     return await asyncio.to_thread(_gen)
 
@@ -127,18 +196,20 @@ def build_prompt(
     question: str,
     evidence: Sequence[dict[str, Any]],
     searched: bool = False,
+    strategy: str = "keyword",
+    author_label: Optional[str] = None,
 ) -> str:
-    # Three cases:
-    #  1. evidence found      -> RAG prompt (answer from it).
-    #  2. searched, no hits   -> say there's no record, don't fabricate.
-    #  3. not a history Q     -> plain conversational prompt, no quoting.
+    # No evidence: either we tried (searched=True, real miss) or we didn't
+    # treat it as a history question. Either way no archive block ships.
     if not evidence and searched:
         return (
             "A server member asked a question about the server's past. "
             "You searched the archive and found NOTHING relevant.\n\n"
             f"MEMBER:\n{question}\n\n"
-            "Tell them plainly and concisely that there's nothing in the "
-            "logs about it. Do NOT invent history and do NOT answer from "
+            "Tell them casually you've got nothing on it - 'idk', "
+            "'no clue from the logs', 'nothing on that'. Do NOT say "
+            "'the evidence does not state' or 'the archive does not "
+            "contain'. Do NOT invent history and do NOT answer from "
             "general knowledge: you genuinely have no record."
         )
     if not evidence:
@@ -149,15 +220,61 @@ def build_prompt(
             "Reply normally and concisely. Do not quote or invent past "
             "messages."
         )
+
+    # Keyword path: tight evidence list, model must cite. The system
+    # instruction enforces CITES when it sees 'ARCHIVED EVIDENCE'.
+    if strategy == "keyword":
+        return (
+            "ARCHIVED EVIDENCE (server history):\n"
+            "------------------------------------\n"
+            f"{_format_evidence(evidence)}\n"
+            "------------------------------------\n\n"
+            f"QUESTION FROM A MEMBER:\n{question}\n\n"
+            "Answer using only the evidence above. Then end with the "
+            "final 'CITES: <id numbers you actually used>' line as "
+            "instructed - only the messages you genuinely referenced, "
+            "not all of them."
+        )
+
+    # Synthesis paths: the model treats this as source material for a
+    # summary/personality read, no CITES required.
+    if strategy == "by_author":
+        who = author_label or "this member"
+        guidance = (
+            f"This is a recent sample of {who}'s messages. Read it and "
+            f"characterise their personality, tone, and what they talk "
+            f"about. Use concrete details and recurring themes you can "
+            f"see in the messages. Don't moralise, don't flatter, don't "
+            f"hedge: give an honest read. If the sample is really too "
+            f"thin to tell, say so."
+        )
+    elif strategy == "multi_author":
+        guidance = (
+            "This is a sample of messages from the most active members "
+            "of the server, grouped by author. Give a short personality "
+            "read for each of the major members you see - one short "
+            "paragraph or a couple of bullets per person, grounded in "
+            "what they actually say. Skip anyone whose sample is too "
+            "thin to read."
+        )
+    else:  # time_sample
+        guidance = (
+            "This is a sample of messages drawn from across the "
+            "server's history, oldest to newest. Summarise the major "
+            "themes, recurring topics, and notable moments or shifts "
+            "you can see. Cite concrete examples (people, channels, "
+            "dates) when they're vivid. Don't fabricate events that "
+            "aren't in the sample."
+        )
+
     return (
-        "ARCHIVED EVIDENCE (server history):\n"
-        "------------------------------------\n"
+        "ARCHIVE SAMPLE (source material for a synthesis answer):\n"
+        "--------------------------------------------------------\n"
         f"{_format_evidence(evidence)}\n"
-        "------------------------------------\n\n"
+        "--------------------------------------------------------\n\n"
         f"QUESTION FROM A MEMBER:\n{question}\n\n"
-        "Answer using only the evidence above. Then end with the final "
-        "'CITES: <id numbers you actually used>' line as instructed - "
-        "only the messages you genuinely referenced, not all of them."
+        f"{guidance}\n"
+        "No CITES line is needed for ARCHIVE SAMPLE; just answer."
     )
 
 
@@ -166,6 +283,8 @@ async def answer_question(
     evidence: Sequence[dict[str, Any]],
     images: Optional[Sequence[Image.Image]] = None,
     searched: bool = False,
+    strategy: str = "keyword",
+    author_label: Optional[str] = None,
 ) -> str:
     """
     Generate an answer grounded in the retrieved evidence. ``searched``
@@ -174,7 +293,10 @@ async def answer_question(
     images on the live question are included for multimodal reasoning.
     Runs the blocking SDK call in a worker thread.
     """
-    prompt = build_prompt(question, evidence, searched)
+    prompt = build_prompt(
+        question, evidence, searched=searched,
+        strategy=strategy, author_label=author_label,
+    )
     parts: list[Any] = [prompt]
     if images:
         parts.extend(images)
