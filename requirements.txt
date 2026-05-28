@@ -6,6 +6,7 @@ discord.py>=2.3.0,<3.0.0
 google-generativeai>=0.7.0
 python-dotenv>=1.0.0
 Pillow>=10.0.0
+numpy>=1.26.0
 
 # External database driver (Turso / libSQL). Required only when
 # TURSO_DATABASE_URL is configured; harmless to install otherwise.

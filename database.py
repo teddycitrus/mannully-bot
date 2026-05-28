@@ -32,7 +32,7 @@ import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 import config
 
@@ -219,6 +219,16 @@ _CREATE_SQL = """
         last_message_id  TEXT,
         last_synced_at   TEXT,
         message_count    INTEGER DEFAULT 0
+    );
+
+    -- Hybrid-retrieval companion table. rowid_pk mirrors messages.rowid_pk
+    -- so a JOIN is cheap and ordering by insertion stays consistent. The
+    -- BLOB is the raw float32 buffer of a 768-dim Gemini embedding (3072
+    -- bytes). Added without a schema_version bump so the existing archive
+    -- is not wiped; old rows just have no embedding until backfilled.
+    CREATE TABLE IF NOT EXISTS message_embeddings (
+        rowid_pk   INTEGER PRIMARY KEY,
+        embedding  BLOB NOT NULL
     );
 """
 
@@ -786,6 +796,135 @@ def get_thread_around(
     )
     combined = list(reversed(before)) + list(after)
     return [_row_to_message(r) for r in combined]
+
+
+# --------------------------------------------------------------------------
+# Embedding storage (hybrid retrieval)
+# --------------------------------------------------------------------------
+def insert_embeddings_batch(rows: Iterable[tuple[int, bytes]]) -> int:
+    """Bulk write (rowid_pk, embedding_bytes) pairs. INSERT OR REPLACE so
+    a re-embedded message overwrites cleanly. Returns the number of rows
+    written.
+    """
+    payload = list(rows)
+    if not payload:
+        return 0
+
+    def _do() -> int:
+        conn = _connect()
+        conn.executemany(
+            "INSERT OR REPLACE INTO message_embeddings (rowid_pk, embedding) "
+            "VALUES (?, ?)",
+            payload,
+        )
+        conn.commit()
+        _maybe_sync()
+        return len(payload)
+
+    with _LOCK:
+        return _run_with_reconnect(_do)
+
+
+def messages_missing_embeddings(
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    """Return up to `limit` archived messages that have no embedding yet.
+
+    Empty-content rows are skipped (nothing to embed). Returned in
+    rowid_pk order so a long backfill makes monotonic progress.
+    """
+    rows = _query(
+        """
+        SELECT m.rowid_pk, m.content, m.guild_id
+        FROM messages m
+        LEFT JOIN message_embeddings e ON e.rowid_pk = m.rowid_pk
+        WHERE e.rowid_pk IS NULL
+          AND m.content != ''
+        ORDER BY m.rowid_pk
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    return rows
+
+
+def get_rowid_by_message_id(message_id: Any) -> Optional[int]:
+    """Look up the integer surrogate key for a Discord message id.
+
+    Used by the live-ingest path: insert_message returns only a "was new"
+    bool, but the embedder needs the rowid_pk to write into
+    message_embeddings and to append to the in-memory cache.
+    """
+    row = _query_one(
+        "SELECT rowid_pk FROM messages WHERE message_id = ?",
+        (str(message_id),),
+    )
+    return int(row["rowid_pk"]) if row else None
+
+
+def count_missing_embeddings() -> int:
+    """How many substantive messages still need an embedding."""
+    row = _query_one(
+        """
+        SELECT COUNT(*) AS c
+        FROM messages m
+        LEFT JOIN message_embeddings e ON e.rowid_pk = m.rowid_pk
+        WHERE e.rowid_pk IS NULL
+          AND m.content != ''
+        """
+    )
+    return int(row["c"]) if row else 0
+
+
+def load_guild_embedding_rows(
+    guild_id: Optional[str],
+) -> list[dict[str, Any]]:
+    """All (rowid_pk, embedding) pairs for one guild, ordered by rowid_pk.
+
+    Callers convert the BLOBs to numpy arrays and stack into a matrix for
+    cosine search. Returned rowid_pks parallel that matrix exactly.
+    """
+    if guild_id is not None:
+        return _query(
+            """
+            SELECT e.rowid_pk, e.embedding
+            FROM message_embeddings e
+            JOIN messages m ON m.rowid_pk = e.rowid_pk
+            WHERE m.guild_id = ?
+            ORDER BY e.rowid_pk
+            """,
+            (str(guild_id),),
+        )
+    return _query(
+        """
+        SELECT e.rowid_pk, e.embedding
+        FROM message_embeddings e
+        ORDER BY e.rowid_pk
+        """
+    )
+
+
+def messages_by_rowids(rowid_pks: Sequence[int]) -> list[dict[str, Any]]:
+    """Fetch full message rows for a list of rowid_pks, preserving the
+    input order. Used to materialise vector-search hits back into the
+    same row shape as BM25 results.
+    """
+    if not rowid_pks:
+        return []
+    # SQLite's IN-list has no fixed cap in practice, but stay safe by
+    # chunking very large requests. K=200 is the realistic ceiling here.
+    placeholders = ",".join("?" for _ in rowid_pks)
+    rows = _query(
+        f"SELECT * FROM messages WHERE rowid_pk IN ({placeholders})",
+        tuple(rowid_pks),
+    )
+    by_rid = {int(r["rowid_pk"]): r for r in rows}
+    out: list[dict[str, Any]] = []
+    for rid in rowid_pks:
+        r = by_rid.get(int(rid))
+        if r is not None:
+            out.append(_row_to_message(r))
+    return out
 
 
 def close() -> None:

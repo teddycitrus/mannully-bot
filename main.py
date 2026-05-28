@@ -23,6 +23,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import discord
+import numpy as np
 from discord.ext import commands
 from PIL import Image
 
@@ -40,7 +41,9 @@ except Exception as exc:  # ConfigError or import failure
     sys.exit(1)
 
 import database
+import embeddings
 import gemini_client
+import retrieval
 import scraper
 
 intents = discord.Intents.default()
@@ -52,6 +55,117 @@ bot = commands.Bot(command_prefix=config.COMMAND_PREFIX, intents=intents)
 
 # Guard so two !sync runs can't overlap on the same process.
 _sync_lock = asyncio.Lock()
+
+# Guard so two backfill loops can't overlap (on_ready may fire more than
+# once per process lifetime if the gateway reconnects).
+_embedding_backfill_lock = asyncio.Lock()
+
+
+# --------------------------------------------------------------------------
+# Embedding backfill + live ingest
+# --------------------------------------------------------------------------
+async def _embedding_backfill_loop() -> None:
+    """Catch the existing archive up to the embedding index.
+
+    Pulls unembedded messages in batches, embeds them via Gemini, writes
+    the vectors to `message_embeddings`, and (if the in-memory cache is
+    already built for that guild) appends them so future hybrid queries
+    pick them up without a rebuild. Loop exits when the archive is fully
+    embedded. Idempotent and safe to re-enter.
+    """
+    if _embedding_backfill_lock.locked():
+        return
+    async with _embedding_backfill_lock:
+        # Gemini's embed endpoint allows up to 100 inputs per call; stay
+        # under that so a single bad row doesn't waste a whole big batch.
+        batch_size = 64
+        total = 0
+        log.info("embedding backfill: starting")
+        while True:
+            try:
+                batch = await asyncio.to_thread(
+                    database.messages_missing_embeddings, batch_size
+                )
+            except Exception:
+                log.exception("backfill: query failed; sleeping 30s")
+                await asyncio.sleep(30)
+                continue
+
+            if not batch:
+                log.info(
+                    "embedding backfill: archive fully embedded "
+                    "(%d messages embedded this run)", total,
+                )
+                return
+
+            texts = [str(r.get("content") or " ") for r in batch]
+            try:
+                vectors = await asyncio.to_thread(
+                    embeddings.embed_documents, texts
+                )
+            except Exception:
+                log.exception("backfill: Gemini call failed; sleeping 30s")
+                await asyncio.sleep(30)
+                continue
+
+            rows = [
+                (
+                    int(r["rowid_pk"]),
+                    v.astype(np.float32, copy=False).tobytes(),
+                )
+                for r, v in zip(batch, vectors)
+            ]
+            try:
+                await asyncio.to_thread(database.insert_embeddings_batch, rows)
+            except Exception:
+                log.exception("backfill: DB write failed; sleeping 30s")
+                await asyncio.sleep(30)
+                continue
+
+            # Keep any already-built per-guild caches current as we go.
+            for r, v in zip(batch, vectors):
+                gid = r.get("guild_id")
+                retrieval.append_to_cache(
+                    str(gid) if gid else None, int(r["rowid_pk"]), v,
+                )
+
+            total += len(batch)
+            if total % 1024 == 0:
+                remaining = await asyncio.to_thread(
+                    database.count_missing_embeddings
+                )
+                log.info(
+                    "embedding backfill: %d done, ~%d remaining",
+                    total, remaining,
+                )
+            # Brief breather between batches so we never starve the
+            # event loop on a huge archive.
+            await asyncio.sleep(0.2)
+
+
+async def _embed_live_message(
+    rowid_pk: int, guild_id: str | None, content: str
+) -> None:
+    """Embed one freshly-archived message and cache it.
+
+    Fire-and-forget: failures are logged but never bubble up to the
+    gateway. Skipped for empty content (nothing to embed) and for
+    duplicates (the row already has an embedding).
+    """
+    if not content.strip():
+        return
+    try:
+        vecs = await asyncio.to_thread(embeddings.embed_documents, [content])
+        if not vecs:
+            return
+        v = vecs[0]
+        await asyncio.to_thread(
+            database.insert_embeddings_batch,
+            [(rowid_pk, v.astype(np.float32, copy=False).tobytes())],
+        )
+        retrieval.append_to_cache(guild_id, rowid_pk, v)
+    except Exception:
+        log.exception("live embedding failed for rowid_pk=%d", rowid_pk)
 
 
 # --------------------------------------------------------------------------
@@ -111,16 +225,18 @@ async def retrieve_evidence(
     exclude_id: int | None = None,
     guild_id: int | None = None,
 ) -> list[dict]:
-    """Combine keyword search with an optional timeframe filter.
+    """Hybrid (BM25 + Gemini-embedding) recall, plus optional timeframe.
 
-    ``guild_id`` scopes both queries to one server so the bot never
-    mixes histories from servers it's also a member of.
+    ``guild_id`` scopes every lookup to one server so the bot never mixes
+    histories from servers it's also a member of. The hybrid path falls
+    back to pure BM25 transparently when the guild has no embeddings yet
+    (backfill not done, or fresh archive).
     """
     limit = config.RAG_MAX_CONTEXT_MESSAGES
     gid = str(guild_id) if guild_id is not None else None
 
-    keyword_hits = await asyncio.to_thread(
-        database.search_by_keyword, question, limit, gid
+    content_hits = await asyncio.to_thread(
+        retrieval.hybrid_search, question, limit, gid
     )
 
     window = parse_timeframe(question)
@@ -132,13 +248,13 @@ async def retrieve_evidence(
         )
 
     # Drop the live question itself: on_message archives the question
-    # before retrieval runs, and FTS5/BM25 ranks the user's own words as
-    # the top hit, which Gemini then cites back at them.
+    # before retrieval runs, and BM25 / vector both rank the user's own
+    # words as a top hit, which Gemini then cites back at them.
     exclude = str(exclude_id) if exclude_id is not None else None
 
     # Merge, de-dupe by message id, keep chronological order for the LLM.
     merged: dict[str, dict] = {}
-    for m in keyword_hits + time_hits:
+    for m in content_hits + time_hits:
         mid = m["message_id"]
         if exclude is not None and str(mid) == exclude:
             continue
@@ -204,6 +320,11 @@ async def on_ready() -> None:
                 config.COMMAND_PREFIX,
             )
 
+    # Catch the embedding index up to whatever's in the archive. Fires
+    # exactly once per process (the lock inside the loop guards re-entry
+    # if the gateway reconnects and on_ready runs again).
+    asyncio.create_task(_embedding_backfill_loop())
+
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
@@ -211,10 +332,11 @@ async def on_message(message: discord.Message) -> None:
     if message.author.id == bot.user.id:
         return
 
-    # Phase 2: persist every incoming message immediately.
+    # Phase 2: persist every incoming message immediately, then embed it
+    # fire-and-forget so future hybrid queries see it.
     if message.guild is not None:
         try:
-            await asyncio.to_thread(
+            inserted = await asyncio.to_thread(
                 database.insert_message,
                 {
                     "message_id": message.id,
@@ -232,6 +354,18 @@ async def on_message(message: discord.Message) -> None:
             )
         except Exception:
             log.exception("Failed to archive live message %s", message.id)
+            inserted = False
+
+        if inserted and (message.content or "").strip():
+            rowid = await asyncio.to_thread(
+                database.get_rowid_by_message_id, message.id
+            )
+            if rowid is not None:
+                asyncio.create_task(
+                    _embed_live_message(
+                        rowid, str(message.guild.id), message.content
+                    )
+                )
 
     # Let the commands extension handle prefixed commands (e.g. !sync).
     await bot.process_commands(message)

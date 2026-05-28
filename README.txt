@@ -8,6 +8,11 @@ Generation (RAG) memory. Ask it about anything that happened in the server
 - days or years ago - and it answers from its own archive using Google
 Gemini 2.5 Flash.
 
+Retrieval is HYBRID: BM25 keyword search (great at names, in-jokes, exact
+recall) is fused with Gemini embedding vector search (great at paraphrase
+and concept queries) via Reciprocal Rank Fusion. Falls back gracefully to
+plain BM25 while embeddings are still being backfilled.
+
 Two ways to run it:
   * LOCAL (default)      - everything in one local file, zero hosting cost.
   * 24/7 / EXTERNAL DB   - archive lives in a hosted Turso (libSQL) database
@@ -141,9 +146,10 @@ Two ways to run it:
        @YourBot what did we decide about the server rules last month?
        @YourBot when did Alex first join the voice channel chats?
 
-   It searches the local archive (keywords + any time reference like
-   "2 days ago" / "yesterday" / "last week"), then asks Gemini to answer
-   strictly from those archived messages, naming the people involved.
+   It searches the local archive (hybrid BM25 + Gemini-embedding recall,
+   plus any time reference like "2 days ago" / "yesterday" / "last week"),
+   then asks Gemini to answer strictly from those archived messages,
+   naming the people involved.
 
  - Or use the command form (no mention needed):
 
@@ -159,10 +165,16 @@ Two ways to run it:
 ---------------------------------------------------------------------------
  9. FILES IN THIS PROJECT
 ---------------------------------------------------------------------------
-   main.py            Bot login, gateway events, commands, RAG loop
+   main.py            Bot login, gateway events, commands, RAG loop,
+                      embedding backfill + live-ingest embedding
    config.py          Loads + validates .env credentials and settings
    scraper.py         Async history pull with rate-limit back-off + resume
-   database.py        SQLite schema, inserts, FTS keyword/time search
+   database.py        SQLite schema, inserts, FTS keyword/time search,
+                      embedding storage
+   embeddings.py      Gemini text-embedding client (gemini-embedding-001,
+                      truncated to 768-dim) with batch + retry
+   retrieval.py       Per-guild vector cache, cosine top-K, BM25+vector
+                      Reciprocal Rank Fusion
    gemini_client.py   Gemini 2.5 Flash prompt + multimodal client
    requirements.txt   Python dependencies
    Dockerfile         Container image for always-on (24/7) hosting
